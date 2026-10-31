@@ -5,8 +5,8 @@ import {
   type AgentDefinition,
   type AgentTracing,
   type DaytonaSandboxEnvironment,
+  type McpConnection,
   type ModelParams,
-  type RemoteMcpHeaders,
   type SandboxProvider,
   type Skill,
   type VercelAIProviderConfig,
@@ -32,11 +32,6 @@ import {
 import type { ReasoningEffort } from '../schemas/modelProvider';
 import { DEFAULT_SANDBOX_ENVIRONMENT_NAME } from '../schemas/sandboxEnvironment';
 import { hasConfiguredWebSearchProvider } from '../websearch/providers';
-
-export interface McpConnection {
-  url: string;
-  headers: RemoteMcpHeaders;
-}
 
 /** Split `provider/model` FQN. Returns undefined when the shape is not exactly one slash. */
 export function parseModelFqn(name: string): { providerName: string; modelName: string } | undefined {
@@ -135,6 +130,7 @@ export async function getMcpConnection({
   }
   return {
     url: record.manifest.url,
+    server: { name: record.name, description: record.manifest.description },
     headers: store.resolveInvokeHeaders({
       record,
       userRef,

@@ -69,6 +69,47 @@ describe('DraftModelSelector', () => {
     updateAgentSpec.mockReset();
   });
 
+  it('shows a model warning on the closed control and its list row', async () => {
+    const warning = "Reasoning effort is not configured for this model, which may affect TrueForge's performance.";
+    renderSelector(
+      {},
+      {
+        getModels: async () => [
+          {
+            id: 'gpt-4.1',
+            name: 'openai/gpt-4.1',
+            provider: { name: 'OpenAI' },
+            properties: {},
+            warning,
+          },
+          {
+            id: 'claude-3.7-sonnet',
+            name: 'anthropic/claude-3.7-sonnet',
+            provider: { name: 'Anthropic' },
+            properties: { reasoningEfforts: ['low', 'high'] },
+          },
+        ],
+      },
+    );
+
+    const trigger = await screen.findByRole('button', { name: 'Select model' });
+    await waitFor(() => expect(trigger).toHaveTextContent('gpt-4.1'));
+    const closedWarning = screen.getByRole('img', { name: warning });
+    expect(closedWarning.closest('button')).toBeNull();
+    fireEvent.mouseEnter(closedWarning.parentElement ?? closedWarning);
+    expect(screen.getByRole('tooltip')).toHaveTextContent(warning);
+
+    fireEvent.click(trigger);
+    const listbox = screen.getByRole('listbox', { name: 'Select model' });
+    const warnedOption = within(listbox).getByRole('option', { name: /gpt-4.1/i });
+    expect(within(warnedOption).getByRole('img', { name: warning })).toBeInTheDocument();
+    expect(
+      within(listbox)
+        .getByRole('option', { name: /claude-3.7-sonnet/i })
+        .querySelector('[role="img"]'),
+    ).toBeNull();
+  });
+
   it('shows the full model name in a tooltip on hover', async () => {
     const longName = 'global.anthropic.claude-sonnet-4-20250514';
     agentSpec = { model: { name: longName } };
@@ -129,7 +170,7 @@ describe('DraftModelSelector', () => {
     expect(updateAgentSpec).toHaveBeenCalledWith({
       model: {
         name: 'anthropic/claude-3.7-sonnet',
-        params: { maxTokens: 512, reasoningEffort: 'low' },
+        params: { maxTokens: 512, reasoningEffort: 'high' },
       },
     });
     expect(screen.queryByRole('listbox', { name: 'Select model' })).not.toBeInTheDocument();
@@ -197,7 +238,7 @@ describe('DraftModelSelector', () => {
     expect(screen.getByRole('button', { name: 'Select model' })).toBeDisabled();
   });
 
-  it('shows a settings CTA when the host has a catalog and no models', async () => {
+  it('shows Configure model when settings chrome is available and no models', async () => {
     renderSelector(
       {},
       {
@@ -206,13 +247,50 @@ describe('DraftModelSelector', () => {
       },
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Select model' }));
-    const cta = await screen.findByRole('button', { name: /Please configure Models in the settings/i });
-    expect(cta.querySelector('.underline')).toHaveTextContent('settings');
+    const cta = await screen.findByRole('button', { name: 'Configure model' });
+    expect(screen.queryByRole('button', { name: 'Select model' })).not.toBeInTheDocument();
 
     fireEvent.click(cta);
     expect(screen.queryByRole('listbox', { name: 'Select model' })).not.toBeInTheDocument();
     expect(screen.getByTestId('settings-open')).toHaveTextContent('true');
+  });
+
+  it('does not flash Configure model before the catalog finishes loading', async () => {
+    let resolveModels!: (value: ModelSelection[]) => void;
+    const modelsPromise = new Promise<ModelSelection[]>(resolve => {
+      resolveModels = resolve;
+    });
+
+    renderSelector(
+      {},
+      {
+        getModels: () => modelsPromise,
+        catalog: createMockCatalog(),
+      },
+    );
+
+    expect(await screen.findByRole('button', { name: 'Select model' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Configure model' })).not.toBeInTheDocument();
+
+    resolveModels([]);
+    expect(await screen.findByRole('button', { name: 'Configure model' })).toBeInTheDocument();
+  });
+
+  it('keeps the model picker when settings chrome is disabled', async () => {
+    renderSelector(
+      {},
+      {
+        getModels: async () => [],
+        catalog: createMockCatalog(),
+        getCapabilities: async () => ({
+          data: { sandbox: { enabled: true }, skill: { enabled: true }, settings: { enabled: false } },
+        }),
+      },
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Select model' }));
+    await waitFor(() => expect(screen.getByText('No models')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Configure model' })).not.toBeInTheDocument();
   });
 
   it('shows No models when the catalog is not configured', async () => {
@@ -220,6 +298,6 @@ describe('DraftModelSelector', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Select model' }));
     await waitFor(() => expect(screen.getByText('No models')).toBeInTheDocument());
-    expect(screen.queryByRole('button', { name: /Please configure Models/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Configure model' })).not.toBeInTheDocument();
   });
 });

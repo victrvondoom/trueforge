@@ -1,6 +1,7 @@
 import { OpenAPIHono } from '@hono/zod-openapi';
 import { AgentSpecSchema, Sessions } from '@truefoundry/trueforge-core/agent-session';
 import { RequestReplyRouter } from '@truefoundry/trueforge-core/request-reply';
+import type { Transaction } from 'kysely';
 import { createClient } from 'redis';
 import { createLogger } from 'winston';
 import { makeCreateTurnInput } from '../../../../trueforge-core/tests/agent-session/testHelpers';
@@ -15,6 +16,7 @@ import { TrueForgeAuthorizer, type Authorizer } from '../../../src/auth/authoriz
 import { STANDALONE_REQUEST_CONTEXT } from '../../../src/auth/identity';
 import { McpServerWithAuthStore } from '../../../src/db/McpServerWithAuthStore';
 import { migrateSqliteToLatest } from '../../../src/db/migrateSqlite';
+import { SqliteAccessControlStore } from '../../../src/db/sqlite/access-control-store/SqliteAccessControlStore';
 import { SqliteAgentStore } from '../../../src/db/sqlite/agent-store/SqliteAgentStore';
 import { createSqliteDb } from '../../../src/db/sqlite/client';
 import { SqliteMcpServerStore } from '../../../src/db/sqlite/mcp-server-store/SqliteMcpServerStore';
@@ -25,10 +27,12 @@ import { SqliteSessionMetricsStore } from '../../../src/db/sqlite/session-metric
 import { SqliteSessionStore } from '../../../src/db/sqlite/session-store/SqliteSessionStore';
 import { SqliteSkillStore } from '../../../src/db/sqlite/skill-store/SqliteSkillStore';
 import { SqliteOAuthTokenStore } from '../../../src/db/sqlite/token-store/SqliteOAuthTokenStore';
+import type { Database } from '../../../src/db/sqlite/types';
 import { SqliteWebSearchProviderStore } from '../../../src/db/sqlite/web-search-provider-store/SqliteWebSearchProviderStore';
+import { EmptyUserStore } from '../../../src/db/userStore';
 import { ActiveTurnRegistry } from '../../../src/runtime/activeTurns';
 import { EventSubscriptionRegistry } from '../../../src/runtime/event-subscription/index.js';
-import { ListSessionsResponseSchema } from '../../../src/schemas/session';
+import { GetSessionResponseSchema, ListSessionsResponseSchema } from '../../../src/schemas/session';
 import {
   GetSessionMetricsChartDataResponseSchema,
   GetSessionMetricsChartResponseSchema,
@@ -75,7 +79,7 @@ describe('sessions HTTP agent binding', () => {
   let agentStore: SqliteAgentStore;
   let sessionStore: SqliteSessionStore;
   let sessionMetricsStore: SqliteSessionMetricsStore;
-  let sessionDeps: SessionsRouterDeps;
+  let sessionDeps: SessionsRouterDeps<Transaction<Database>>;
   let resolveModelProviderStore: jest.Mock;
   let resolveMcpServerStore: jest.Mock;
   let resolveSkillStore: jest.Mock;
@@ -114,9 +118,12 @@ describe('sessions HTTP agent binding', () => {
     resolveModelProviderStore = jest.fn(() => modelProviderStore);
     resolveMcpServerStore = jest.fn(() => mcpServerStore);
     resolveSkillStore = jest.fn(() => skillStore);
-    const deps: SessionsRouterDeps = {
+    const deps: SessionsRouterDeps<Transaction<Database>> = {
       sessions,
       sessionStore,
+      accessControlStore: new SqliteAccessControlStore(db),
+      userStore: new EmptyUserStore(),
+      withTransaction: callback => db.transaction().execute(callback),
       activeTurns: new ActiveTurnRegistry(),
       resolveModelProviderStore,
       resolveMcpServerStore,
@@ -140,6 +147,7 @@ describe('sessions HTTP agent binding', () => {
       createTurnsRouter({
         sessions,
         sessionStore,
+        accessControlStore: new SqliteAccessControlStore(db),
         activeTurns: deps.activeTurns,
         resolveModelProviderStore: () => modelProviderStore,
         resolveMcpServerStore: () =>
@@ -149,6 +157,7 @@ describe('sessions HTTP agent binding', () => {
             clientName: 'test-client',
           }),
         resolveTurnSkillsStore: () => skillStore,
+        resolveCapabilitiesStore: () => ({ resolveCapabilities: () => [] }),
         resolveAgentStore: () => agentStore,
         eventSubscriptions: new EventSubscriptionRegistry(undefined),
         resolveSandboxProviderStore: () => sandboxProviderStore,
@@ -194,6 +203,22 @@ describe('sessions HTTP agent binding', () => {
       subject_display_name: STANDALONE_REQUEST_CONTEXT.subject.display_name,
     });
     expect(json.data.metrics).toEqual({ total_duration_ms: 0, total_turns: 0 });
+  });
+
+  it('returns last_turn_details on get and list', async () => {
+    const created = await app.request('/', jsonInit('POST', { agent: { spec: inlineSpec } }));
+    expect(created.status).toBe(201);
+    const session = GetSessionResponseSchema.parse(await created.json()).data;
+    expect(session.last_turn_details).toBeNull();
+
+    await sessionStore.createTurn(makeCreateTurnInput({ sessionId: session.id, turnId: 'turn-1' }));
+    const expected = { id: 'turn-1', state: { status: 'running' } };
+
+    const fetched = await app.request(`/${session.id}`);
+    expect(GetSessionResponseSchema.parse(await fetched.json()).data.last_turn_details).toEqual(expected);
+
+    const listed = ListSessionsResponseSchema.parse(await (await app.request('/')).json()).data;
+    expect(listed.find(item => item.id === session.id)?.last_turn_details).toEqual(expected);
   });
 
   it('returns 404 when creating a session for an unknown agent name', async () => {

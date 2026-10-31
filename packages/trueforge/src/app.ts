@@ -26,6 +26,7 @@ import { createInternalSessionsRouter, createSessionsRouter } from './apis/sessi
 import { createSettingsRouter } from './apis/settings';
 import { createAvailableSkillsRouter } from './apis/skills';
 import { createTurnsRouter } from './apis/turns';
+import { createUsersRouter } from './apis/users';
 import type { Authenticator } from './auth/authenticator';
 import type { Authorizer } from './auth/authorizer';
 import { resolveRequestContext } from './auth/identity';
@@ -41,6 +42,7 @@ import type { SandboxCatalog } from './catalog/SandboxCatalog';
 import type { SkillCatalog } from './catalog/SkillCatalog';
 import type { WebSearchCatalog } from './catalog/WebSearchCatalog';
 import configuration, { getPublicUiBasePath, getTrueForgeAuthMode, TrueForgeAuthMode } from './config';
+import type { IAccessControlStore } from './db/accessControlStore';
 import type { AgentRecord, IAgentStore } from './db/agentStore';
 import type { IMcpServerWithAuthStore } from './db/mcpServerStore';
 import type { IModelProviderStore } from './db/modelProviderStore';
@@ -50,8 +52,9 @@ import type { IScheduleStore } from './db/scheduleStore';
 import type { ISessionMetricsStore } from './db/sessionMetricsStore';
 import type { ISkillStore } from './db/skillStore';
 import type { WithTransaction } from './db/transaction';
+import type { IUserStore } from './db/userStore';
 import type { IWebSearchProviderStore } from './db/webSearchProviderStore';
-import { createHttpMetrics } from './http/prometheus';
+import type { HttpMetrics } from './http/prometheus';
 import { createClientCertificateMiddleware } from './http/tls';
 import { runWithLogContext, updateLogContext, type LogContext } from './logger';
 import type { IOAuthTokenStore } from './mcp/auth/types';
@@ -60,6 +63,7 @@ import { OPENAPI_DOCUMENT_TAGS } from './routes/openapiTags';
 import type { ActiveTurnRegistry } from './runtime/activeTurns';
 import type { EventSubscriptionRegistry } from './runtime/event-subscription';
 import { InvalidCronError } from './schemas/schedule';
+import type { ICapabilitiesStore } from './truefoundry/inlineTools';
 import { zodErrorResponse, zodValidationHook } from './zodErrorResponse';
 
 const BEARER_AUTH_SCHEME = 'BearerAuth';
@@ -159,6 +163,7 @@ export function createAppErrorHandler(params: { logger: Logger }): ErrorHandler 
         path: c.req.path,
         status,
         ...extractErrorLogFields(error),
+        ...(status >= 500 ? { reportable_error: { error } } : {}),
       };
       if (status >= 500) {
         params.logger.error(message, fields);
@@ -262,6 +267,11 @@ export interface ResolveTurnSkillsStoreInput {
   allowInlineResources?: boolean;
 }
 
+/** Turn capability resolve. Omit `c` for schedules, which have no `x-tfg-tools`. */
+export interface ResolveCapabilitiesStoreInput {
+  c?: Context;
+}
+
 /** HTTP skill-store resolve. `allowInlineResources` for inline session create and spec replace. */
 export interface ResolveSkillStoreInput {
   c: Context;
@@ -296,11 +306,16 @@ export interface ServerDeps<TTransaction> {
    * schedules call with `{}` (registry/DB only).
    */
   resolveTurnSkillsStore: (input: ResolveTurnSkillsStoreInput) => Pick<ISkillStore<TTransaction>, 'resolveTurnSkills'>;
+  /** `x-tfg-tools` for this turn. Schedules call with `{}` and mount nothing. */
+  resolveCapabilitiesStore: (input: ResolveCapabilitiesStoreInput) => ICapabilitiesStore;
   withTransaction: WithTransaction<TTransaction>;
   tokenStore: IOAuthTokenStore<TTransaction>;
   scheduleStore: IScheduleStore<TTransaction>;
   sessionStore: ISessionStore;
+  accessControlStore: IAccessControlStore<TTransaction>;
   sessionMetricsStore: ISessionMetricsStore;
+  /** Tenant users that sessions can be shared with. */
+  userStore: IUserStore;
   /** Persistence agent store (schedule runs resolve the bound agent without an HTTP caller). */
   agentStore: IAgentStore<TTransaction>;
   /** Sandbox environment parent + version persistence (no TrueFoundry dual-write). */
@@ -325,6 +340,8 @@ export interface ServerDeps<TTransaction> {
   authenticator: Authenticator;
   /** Startup-selected agent authorization policy. */
   authorizer: Authorizer;
+  /** Shared scrape target. HTTP middleware and `GET /metrics` use this registry. */
+  httpMetrics: HttpMetrics;
 }
 
 export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
@@ -346,9 +363,10 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
     resolveWebSearchProviderStore: deps.resolveWebSearchProviderStore,
     activeTurns: deps.activeTurns,
     resolveTurnSkillsStore: deps.resolveTurnSkillsStore,
+    resolveCapabilitiesStore: deps.resolveCapabilitiesStore,
   };
 
-  const httpMetrics = createHttpMetrics();
+  const httpMetrics = deps.httpMetrics;
   app.use('*', createRequestLogContextMiddleware());
   app.use('/api/v1/sessions/:session_id/*', createSessionPathLogContextMiddleware());
   app.use('/api/v1/sessions/:session_id/turns/:turn_id/*', createSessionPathLogContextMiddleware());
@@ -374,11 +392,16 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
     }),
   );
   app.route(
+    '/api/v1/users',
+    withAuth(createUsersRouter({ userStore: deps.userStore, resolveRequestContext }), authMiddleware),
+  );
+  app.route(
     '/api/v1/capabilities',
     withAuth(
       createCapabilitiesRouter({
         sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
         resolveWebSearchProviderStore: deps.resolveWebSearchProviderStore,
+        userStore: deps.userStore,
         withTransaction: deps.withTransaction,
         logger: deps.logger,
         resolveRequestContext,
@@ -528,6 +551,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
     withAuth(
       createInternalSessionsRouter({
         sessions: deps.sessions,
+        accessControlStore: deps.accessControlStore,
         resolveModelProviderStore: deps.resolveModelProviderStore,
         resolveMcpServerStore: deps.resolveMcpServerStore,
         resolveSkillStore: deps.resolveSkillStore,
@@ -560,6 +584,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
         authorizer: deps.authorizer,
         resolveAgentStore: deps.resolveAgentStore,
         scheduleStore: deps.scheduleStore,
+        sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
         sessionStore: deps.sessionStore,
         resolveRequestContext,
       }),
@@ -572,6 +597,9 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
       createSessionsRouter({
         sessions: deps.sessions,
         sessionStore: deps.sessionStore,
+        accessControlStore: deps.accessControlStore,
+        userStore: deps.userStore,
+        withTransaction: deps.withTransaction,
         activeTurns: deps.activeTurns,
         resolveModelProviderStore: deps.resolveModelProviderStore,
         resolveMcpServerStore: deps.resolveMcpServerStore,
@@ -595,10 +623,12 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
       createTurnsRouter({
         sessions: deps.sessions,
         sessionStore: deps.sessionStore,
+        accessControlStore: deps.accessControlStore,
         activeTurns: deps.activeTurns,
         resolveModelProviderStore: deps.resolveModelProviderStore,
         resolveMcpServerStore: deps.resolveMcpServerStore,
         resolveTurnSkillsStore: deps.resolveTurnSkillsStore,
+        resolveCapabilitiesStore: deps.resolveCapabilitiesStore,
         resolveAgentStore: deps.resolveAgentStore,
         eventSubscriptions: deps.eventSubscriptions,
         resolveSandboxProviderStore: deps.resolveSandboxProviderStore,

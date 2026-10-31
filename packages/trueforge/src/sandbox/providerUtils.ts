@@ -16,7 +16,6 @@ import {
   type SandboxStatus,
   type StoredSandboxProviderManifest,
 } from '../schemas/sandboxProvider';
-import { captureCriticalException } from '../sentry';
 
 /** Bound Daytona RPCs so API requests and controller ticks cannot hang indefinitely. */
 export const DAYTONA_RPC_TIMEOUT_MS = 5_000;
@@ -46,6 +45,29 @@ export function getDaytonaAuthorizationErrorMessage(error: unknown): string | un
   }
   if (isDaytonaPermissionError(error)) {
     return 'Sandbox provider denied access: the API key is missing required permissions';
+  }
+  return undefined;
+}
+
+/**
+ * Daytona failures that should fail a pending env-version build (no retry).
+ * Authz and other 4xx client rejects (e.g. per-sandbox disk/cpu caps).
+ * 429 is retryable. Snapshot-name 409 is handled in DaytonaProvider.build.
+ */
+export function getDaytonaBuildFailureMessage(error: unknown): string | undefined {
+  const authorizationMessage = getDaytonaAuthorizationErrorMessage(error);
+  if (authorizationMessage !== undefined) {
+    return authorizationMessage;
+  }
+  if (!(error instanceof DaytonaError) || error.statusCode === undefined) {
+    return undefined;
+  }
+  const { statusCode } = error;
+  if (statusCode === 429) {
+    return undefined;
+  }
+  if (statusCode >= 400 && statusCode < 500) {
+    return error.message;
   }
   return undefined;
 }
@@ -110,11 +132,6 @@ export function toDaytonaSandboxProvider({
     tenantName: tenant_id,
     fileMaxBytesForDownload: configuration.SANDBOX_FILE_MAX_BYTES_FOR_DOWNLOAD,
     logger,
-    onCriticalAlert: error => {
-      captureCriticalException(error, {
-        tags: { module: 'DaytonaProvider', operation: 'sandboxCreate', priority: 'P1' },
-      });
-    },
   });
 }
 
